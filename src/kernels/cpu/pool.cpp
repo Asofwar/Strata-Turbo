@@ -615,6 +615,8 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
     if (tasks < 0 || tasks > kMaxTasks) throw std::invalid_argument("expert pool tasks must be in 0..4096");
     if (const char* e = std::getenv("STRATA_POOL_SPIN_US"))   // a test knob; see kSpinBeforeSleep
         spin_before_sleep_ = std::chrono::microseconds((std::max)(0, std::atoi(e)));
+    if (const char* e = std::getenv("STRATA_POOL_DIET"))      // skip the repark waits; see run_phase
+        pool_diet_ = std::atoi(e) != 0;
     const PoolPlanInput plan_in = pool_plan_input(topo_);
     const PoolPlan plan = plan_pool_workers(plan_in);
     if (n_workers > 0) {
@@ -1002,7 +1004,12 @@ void ExpertPool::run_phase(int mode, int n_tasks) {
     if (host_works_) drain(-1, host_scratch_, e);
     wait_done(n_tasks);
     const int64_t t_done = pslot_ ? now_ns() : 0;
-    wait_parked("after a phase");
+    // STRATA_POOL_DIET=1 (from svgop/Strata f61528665, F-227: +4.1% decode on an RTX 5090 + 9950X3D): skip the repark.
+    // Every job is done here; a worker still between the park and its first claim holds this batch's epoch, so its
+    // claims fail (claim) and it parks again without touching a job.  The next phase's leading wait_parked collects
+    // it under the host's own setup work instead of serialising the slowest park onto this thread.  With
+    // STRATA_POOL_STATS the late threads count as missed or empty for this phase.
+    if (!pool_diet_) wait_parked("after a phase");
     hstate_.store(kIdle, std::memory_order_relaxed);
     hstate_ms_.store(now_ms(), std::memory_order_relaxed);
     if (pslot_) {
@@ -1191,9 +1198,10 @@ void ExpertPool::run(ExpertJob* jobs, int n) {
 
     wait_done(n);
     // And park again, so the next `run` starts from a known state.  See the header for why `done` alone is
-    // not enough.
+    // not enough.  STRATA_POOL_DIET skips it: the epoch claim fences stragglers (see run_phase), and the next
+    // `run`'s leading wait parks them.
     const auto t_c = std::chrono::steady_clock::now();
-    wait_parked("after a batch");
+    if (!pool_diet_) wait_parked("after a batch");
     hstate_.store(kIdle, std::memory_order_relaxed);
     hstate_ms_.store(now_ms(), std::memory_order_relaxed);
     const auto t_d = std::chrono::steady_clock::now();

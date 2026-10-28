@@ -3597,6 +3597,33 @@ cause not proven. The reserve is a safety setting, not a timed one:
 removing `--vram-reserve-mib` from the config gives the speed back, at that risk. Not measured: 130K-200K inside the
 calibration (only the comparison), other PCs, sampled answers (the calibration answers greedily), Linux.
 
+### Taken from other forks: `STRATA_DENSE_ONE_ALLOC`, `STRATA_NO_PCIE_GROUP`, `STRATA_POOL_DIET`
+
+Three switches from other forks of Strata, each off unless set and none written by setup. Checked on the PC above
+with a 3,542-token prompt and a 512-token answer, `--greedy --deterministic`, `--pcie-frac 0.00` and the live server's
+other switches: with the same number of expert slots every arm wrote the same token ids as the run without them (off,
+`STRATA_DENSE_ONE_ALLOC=1` alone and all three: 5,945 slots; off and the other two together: 4 more interleaved pairs).
+
+| Switch | From | What it does | Measured here |
+|---|---|---|---|
+| `STRATA_DENSE_ONE_ALLOC=1` | mandoof1/Strata 5827b0528 ("iq3b S1") | after loading, the dense matrices and the scratch move into one allocation (the same bytes at 4 KiB boundaries) instead of one `cudaMalloc` each, rounded to 2 MiB granules | 251 buffers in 1,423.8 MiB, 276.0 MiB of VRAM freed; with `--kv-grow` the cache takes it: 7,955 -> 8,151 slots |
+| `STRATA_NO_PCIE_GROUP=1` | zsariboga/Strata 106bfbb7f (upstream PR #2223) | at `--pcie-frac 0` the verify window graphs have no PCIe-share stage (the flag B wait, the staging copy and the grouped launch over zero groups) | no difference resolved (below) |
+| `STRATA_POOL_DIET=1` | svgop/Strata f61528665 (their F-227) | `run_phase` and `run` return after `wait_done` without waiting for the workers to park again; the next phase's leading wait collects them, and a late worker's claim fails on the epoch | no difference resolved (below) |
+
+`STRATA_NO_PCIE_GROUP` is turned off at start-up where a PCIe share can appear (a share above 0, PcieAuto, two GPUs, a
+peer device, `STRATA_PCIE_BALANCE`), a request's `pcie_frac` key then stays 0, and a plan that names PCIe experts all
+the same stops the engine instead of dropping them. With `STRATA_DENSE_ONE_ALLOC=1` the answer changes only through the
+slots the freed VRAM buys (more experts computed on the GPU). The one allocation needs the payload once more while it
+copies; with less than that plus 256 MiB free it is not tried (so WDDM's sysmem fallback cannot place part of it in
+system RAM), the separate buffers stay and the engine says so. The weights' VRAM price before loading stays that of the
+separate buffers either way.
+
+Decode, 4 interleaved pairs (512 tokens, 5,000-slot budget, no `--kv-grow`): without the two scheduling switches
+167.7-208.7 tok/s (median 183.3), with them 170.7-191.5 (median 181.7). The CPU pool took 1.7-3.5 ms a round in the
+same runs (other programs ran on the CPU), so a 2-4% effect cannot be read from them. The forks measured +2.3% (RTX
+2080 Ti, Flash-Next Q2_0, `STRATA_NO_PCIE_GROUP`) and +4.1% (RTX 5090 + 9950X3D, Flash-Next IQ3_S, `STRATA_POOL_DIET`).
+Not measured: a quiet CPU, 130K-262K of context, `--serve`, the HIP and SYCL builds.
+
 ## CUDA opt-in switches measured for 0.1.45 (RTX 3060 and RTX A4000, sm_86; all off unless you set them)
 
 Ported from open pull requests and A/B'd as whole engine runs against the default (a fresh engine per side, IQ3_XXS, 5 pairs, medians;

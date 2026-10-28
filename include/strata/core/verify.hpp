@@ -60,6 +60,12 @@ struct AdaptGate {
     }
 };
 
+/// STRATA_NO_PCIE_GROUP=1 (opt-in): the verify windows are recorded without the PCIe-share stage (flag B wait, staging
+/// copy, grouped launch), which only ever sees zero groups at --pcie-frac 0.  set_no_pcie_group(false) turns it off;
+/// call it before the first window is recorded, where a PCIe share can appear (a share above 0, PcieAuto, two GPUs).
+bool no_pcie_group();
+void set_no_pcie_group(bool on);
+
 class NativeHead;
 class RemoteExpertOpt;
 
@@ -470,7 +476,10 @@ private:
     int device_ = -1;                    ///< the device `init` ran on: run/commit switch to it (layer split)
     unsigned long long* rr_stats_ = nullptr;   ///< STRATA_ROUTE_RESIDENT's counters on device_ (#1578); null: none
     std::atomic<bool> released_{false};  ///< #267: release_gpu_waits ran (maybe on the watchdog thread): no more windows
-    bool all_resident_ = false;           ///< 100% of experts in [lb_, le_) resident in VRAM: zero-doorbell graph
+    /// STRATA_NO_PCIE_GROUP=1: the window graph has no PCIe stage, so a published plan for layer `l` (flag A at `want`)
+    /// that names PCIe experts stops the engine instead of dropping them
+    void no_pcie_share_check(int64_t l, uint32_t want);
+    bool all_resident_ = false;          ///< 100% of experts in [lb_, le_) resident in VRAM: zero-doorbell graph
     /// #871: the zero-doorbell graph plans from the device residency table alone, so it is only right while every
     /// expert of the stage is in VRAM.  A prompt loan, a VRAM shrink or an adaptive swap marks some -1 for a while:
     /// every window then runs the doorbell graph (exec_nr_ / the batch key's top bit), the same as a stage that never

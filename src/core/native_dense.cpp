@@ -33,6 +33,20 @@ namespace {
 // far worse, 2378 MiB: the driver packs the sub-MiB matrices into the slack of the rounded ones.)
 constexpr uint64_t kAllocGranule = 2ull << 20;
 constexpr uint64_t kSmallAlloc = 1ull << 20;
+// STRATA_DENSE_ONE_ALLOC=1 (opt-in; from mandoof1/Strata 5827b0528, "iq3b S1"): `load` moves every buffer it made into
+// ONE allocation, each at a 4 KiB boundary, so the 2 MiB granules of the separate buffers stop costing VRAM that the
+// expert cache can use.  The bytes are copied as they are (the same values; every buffer keeps at least the 256 B
+// alignment the kernels assume).  Unset or =0: one cudaMalloc per matrix, as before.  `alloc_bytes` keeps pricing the
+// separate buffers either way: `load` falls back to them when the one allocation does not fit, so the price stays on
+// the safe side.
+constexpr uint64_t kArenaAlign = 4096;
+// the one allocation needs the payload a second time while it copies; below this much more free VRAM it is not tried,
+// so that WDDM's sysmem fallback cannot put part of it in system RAM
+constexpr uint64_t kArenaMargin = 256ull << 20;
+bool one_alloc_env() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_DENSE_ONE_ALLOC"); return v != nullptr && v[0] != 0 && v[0] != '0'; }();
+    return on;
+}
 uint64_t alloc_bytes(uint64_t bytes) {
     return bytes < kSmallAlloc ? bytes : (bytes + kAllocGranule - 1) / kAllocGranule * kAllocGranule;
 }
@@ -158,6 +172,8 @@ struct Pending {
     uint64_t bytes;
     DevicePtr data;
     DevicePtr packed;   // STRATA_Q8_PACKED=1 copy, or null
+    void* data_view = nullptr;     // STRATA_DENSE_ONE_ALLOC: the matrix's place in the one allocation (data freed), or null
+    void* packed_view = nullptr;
 };
 }
 
@@ -244,6 +260,10 @@ NativeDense::~NativeDense() {
             for (void*& b : cl)
                 if (b != nullptr && std::find(weights_.begin(), weights_.end(), b) != weights_.end()) b = nullptr;
     for (const void* p : packed_keys_) strata::kernels::native_q8_0_packed_unregister(p);
+    if (arena_) {   // STRATA_DENSE_ONE_ALLOC: weights_ and scratch_ are views into it
+        cudaFree(arena_);
+        return;
+    }
     if (scratch_) cudaFree(scratch_);
     for (void* p : weights_) cudaFree(p);
 }
@@ -259,6 +279,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
     if (shards.empty()) { err = "native dense: at least one GGUF shard is required"; return false; }
     try {
         std::vector<Pending> pending;
+        std::vector<uint64_t> weight_sizes;   // the bytes of each weights_ entry (STRATA_DENSE_ONE_ALLOC)
         std::set<std::string> seen;
         int max_in = 0;
         uint64_t total = 0, hc_q8_bytes = 0, allocated = 0;
@@ -405,6 +426,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     }
                     ref.hc_q8 = p;
                     weights_.push_back(p);
+                    weight_sizes.push_back(bytes);
                     hc_q8_bytes += bytes;
                 }
         }
@@ -426,6 +448,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 void* p = nullptr;
                 if (cudaMalloc(&p, bytes) != cudaSuccess) { err = "native dense (STRATA_HC_Q8) alloc " + name; return false; }
                 weights_.push_back(p);
+                weight_sizes.push_back(bytes);
                 if (skipped) {
                     std::vector<uint16_t> host;
                     if (!table.read_bf16_host(name, host, err)) return false;
@@ -456,6 +479,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                         void* b = nullptr;
                         if (cudaMalloc(&b, (size_t) elems * 2) != cudaSuccess) { err = "native dense (STRATA_HC_Q8): scratch alloc"; return false; }
                         weights_.push_back(b);
+                        weight_sizes.push_back((uint64_t) elems * 2);
                         g_hc_scratch[dev][c][i] = b;
                     }
                 for (int i = 0; i < 2; ++i)
@@ -469,28 +493,101 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         const auto status = cudaMalloc(&allocation, strata::kernels::native_q8_1_bytes(max_in));
         DevicePtr scratch(allocation);
         if (status != cudaSuccess) { err = std::string("native dense scratch: ") + cudaGetErrorString(status); return false; }
+        void* scratch_view = nullptr;
+        if (one_alloc_env()) {
+            // STRATA_DENSE_ONE_ALLOC: every buffer above moves into one allocation (a D2D copy of the same bytes),
+            // then the separate ones are freed: hundreds of cudaMallocs each rounded to 2 MiB granules cost the cache
+            // 150-300 MiB.  Before any reference is published, except the hc_q8 pointers, which are re-pointed here.
+            // If the one allocation does not fit (it needs the payload once more, briefly), the separate buffers stay.
+            struct Move { void* from; uint64_t bytes; uint64_t off; };
+            std::vector<Move> moves;
+            uint64_t at = 0;
+            auto add = [&](void* p, uint64_t bytes) {
+                moves.push_back(Move{p, bytes, at});
+                at += (bytes + kArenaAlign - 1) / kArenaAlign * kArenaAlign;
+            };
+            for (auto& item : pending) {
+                add(item.data.get(), item.bytes);
+                if (item.packed) add(item.packed.get(), item.bytes);
+            }
+            for (size_t i = 0; i < weights_.size(); ++i) add(weights_[i], weight_sizes[i]);
+            const uint64_t scratch_bytes = strata::kernels::native_q8_1_bytes(max_in);
+            add(scratch.get(), scratch_bytes);
+            size_t free0 = 0, free1 = 0, total_b = 0;
+            const bool have_free = cudaDeviceSynchronize() == cudaSuccess && cudaMemGetInfo(&free0, &total_b) == cudaSuccess;
+            void* arena = nullptr;
+            bool ok = have_free && (uint64_t) free0 >= at + kArenaMargin && cudaMalloc(&arena, at) == cudaSuccess;
+            for (size_t i = 0; ok && i < moves.size(); ++i)
+                ok = cudaMemcpy((uint8_t*) arena + moves[i].off, moves[i].from, moves[i].bytes, cudaMemcpyDeviceToDevice) ==
+                     cudaSuccess;
+            ok = ok && cudaDeviceSynchronize() == cudaSuccess;
+            if (!ok) {
+                if (arena) cudaFree(arena);
+                (void) cudaGetLastError();
+                std::fprintf(stderr, "native dense: STRATA_DENSE_ONE_ALLOC: the one allocation (%.1f MiB, %.1f MiB free) does "
+                                     "not fit; keeping %zu separate buffers\n", (double) at / 1048576.0,
+                             (double) free0 / 1048576.0, moves.size());
+            } else {
+                std::map<const void*, void*> moved;
+                for (const auto& m : moves) moved[m.from] = (uint8_t*) arena + m.off;
+                for (auto& [name, ref] : table.table_)
+                    if (ref.hc_q8 != nullptr) {
+                        const auto f = moved.find(ref.hc_q8);
+                        if (f != moved.end()) ref.hc_q8 = f->second;
+                    }
+                int dev = 0;
+                if (cudaGetDevice(&dev) == cudaSuccess && dev >= 0 && dev < 64)
+                    for (auto& cl : g_hc_scratch[dev])
+                        for (void*& b : cl) {
+                            const auto f = b != nullptr ? moved.find(b) : moved.end();
+                            if (f != moved.end()) b = f->second;
+                        }
+                for (auto& item : pending) {
+                    item.data_view = moved[item.data.get()];
+                    item.data.reset();
+                    if (item.packed) {
+                        item.packed_view = moved[item.packed.get()];
+                        item.packed.reset();
+                    }
+                }
+                for (void*& p : weights_) {
+                    void* to = moved[p];
+                    cudaFree(p);
+                    p = to;
+                }
+                scratch_view = moved[scratch.get()];
+                scratch.reset();
+                arena_ = arena;
+                if (have_free && cudaMemGetInfo(&free1, &total_b) == cudaSuccess)
+                    std::fprintf(stderr, "native dense: STRATA_DENSE_ONE_ALLOC: %zu buffers in one allocation of %.1f MiB; "
+                                         "VRAM saved %.1f MiB (unset: one allocation each)\n", moves.size(),
+                                 (double) at / 1048576.0, ((double) free1 - (double) free0) / 1048576.0);
+                allocated = (at + kAllocGranule - 1) / kAllocGranule * kAllocGranule;
+            }
+        }
         // All checks and allocations finish before publishing any reference.
         weights_.reserve(pending.size());
         uint64_t packed_bytes = 0;
         size_t packed_count = 0;
         for (auto& item : pending) {
-            item.ref->native_data = item.data.get();
+            void* data = item.data_view ? item.data_view : item.data.get();
+            void* packed = item.packed_view ? item.packed_view : item.packed.get();
+            item.ref->native_data = data;
             item.ref->native_type = item.type;
-            item.ref->native_q8_1 = scratch.get();
-            if (item.packed) {
-                strata::kernels::native_q8_0_packed_register(item.data.get(), item.packed.get(), (int) item.ref->ne0,
-                                                             (int) item.ref->ne1);
-                packed_keys_.push_back(item.data.get());
+            item.ref->native_q8_1 = scratch_view ? scratch_view : scratch.get();
+            if (packed) {
+                strata::kernels::native_q8_0_packed_register(data, packed, (int) item.ref->ne0, (int) item.ref->ne1);
+                packed_keys_.push_back(data);
                 packed_bytes += item.bytes;
                 ++packed_count;
-                weights_.push_back(item.packed.release());
+                weights_.push_back(item.packed_view ? packed : item.packed.release());
             }
-            weights_.push_back(item.data.release());
+            weights_.push_back(item.data_view ? data : item.data.release());
         }
         if (packed_count)
             std::fprintf(stderr, "native dense: STRATA_Q8_PACKED=1 packed %zu Q8_0 matrices for decode (+%.1f MiB)\n",
                          packed_count, packed_bytes / 1048576.0);
-        scratch_ = scratch.release();
+        scratch_ = scratch_view ? scratch_view : scratch.release();
         bytes_ = total + hc_q8_bytes;
         allocated_ = allocated;
         if (hc_q8_env())

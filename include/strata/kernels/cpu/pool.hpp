@@ -339,6 +339,9 @@ private:
     std::mutex sleep_mu_;
     std::condition_variable sleep_cv_;
     std::chrono::microseconds spin_before_sleep_{kSpinBeforeSleep};
+    // STRATA_POOL_DIET=1 (opt-in, the same bits): `run_phase` and `run` return after `wait_done` without waiting for
+    // the workers to park again; the next phase's leading `wait_parked` collects them (see run_phase)
+    bool pool_diet_ = false;
     std::vector<std::thread> threads_;
     std::vector<ExpertScratch> scratch_;   // one per worker: no allocation, no false sharing of the hot data
     struct alignas(64) ThreadStatSlot { ThreadStat s; };

@@ -3698,6 +3698,14 @@ int main(int argc, char** argv) {
     };
     // --deterministic: PcieAuto sets the share from the CPU pool's wall time; the share stays at its start value
     if (strata::core::deterministic()) o.pcie_frac_auto = false;
+    // STRATA_NO_PCIE_GROUP=1 records the verify windows without the PCIe-share stage, so it holds only where no share
+    // can appear: one GPU, --pcie-frac 0, no PcieAuto refinement and no STRATA_PCIE_BALANCE
+    if (strata::core::no_pcie_group() &&
+        (o.pcie_frac > 0.0 || o.pcie_frac_auto || multi_gpu || o.peer_device >= 0 || pcie_balance())) {
+        std::fprintf(stderr, "strata generate: STRATA_NO_PCIE_GROUP=1 needs --pcie-frac 0 on one GPU (pcie_frac %.2f%s) "
+                             "- left off\n", o.pcie_frac, o.pcie_frac_auto ? ", refined" : "");
+        strata::core::set_no_pcie_group(false);
+    }
     mem_mark("the CUDA context (the PCIe probe)");
     // the canonical Q2_0 pack's CPU kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well
     if (!native_pack) {
@@ -12605,7 +12613,16 @@ int main(int argc, char** argv) {
                     else if (key == "penalty_freq") req_penalty_freq = fv;
                     else if (key == "penalty_present") req_penalty_present = fv;
                     else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
-                    else if (key == "pcie_frac") { req_pcie_frac = std::clamp((double) fv, 0.0, 1.0); req_pcie_set = true; }
+                    else if (key == "pcie_frac") {
+                        req_pcie_frac = std::clamp((double) fv, 0.0, 1.0);
+                        req_pcie_set = true;
+                        if (req_pcie_frac > 0.0 && strata::core::no_pcie_group()) {   // the windows have no PCIe stage
+                            static bool said = false;
+                            if (!said) std::fprintf(stderr, "strata serve: STRATA_NO_PCIE_GROUP=1: a request's pcie_frac stays 0\n");
+                            said = true;
+                            req_pcie_frac = 0.0;
+                        }
+                    }
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "spec_t") req_spec_t = std::clamp(std::atoi(tok.c_str() + eq + 1), 0, 8);
                     else if (key == "spec_s") req_spec_s = std::clamp(std::atoi(tok.c_str() + eq + 1), 0, 8);
